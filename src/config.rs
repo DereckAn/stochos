@@ -6,21 +6,47 @@ use std::sync::OnceLock;
 use crate::backend::KeyEvent;
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
+static FONT: OnceLock<Option<ab_glyph::FontVec>> = OnceLock::new();
 const SCALE_RANGE: std::ops::RangeInclusive<u32> = 1..=10;
 
 /// Falls back to the default config when the file can't be loaded, and
-/// returns the error so the caller can show it.
+/// returns the error so the caller can show it. A font that can't be loaded
+/// falls back to the built-in one the same way.
 pub fn init() -> anyhow::Result<()> {
-    let (config, result) = match Config::load() {
+    let (config, mut result) = match Config::load() {
         Ok(config) => (config, Ok(())),
         Err(e) => (Config::default(), Err(e)),
     };
+    let font = match config.font.as_deref().map(load_font).transpose() {
+        Ok(font) => font,
+        Err(e) => {
+            result = result.and(Err(e));
+            None
+        }
+    };
+    let _ = FONT.set(font);
     let _ = CONFIG.set(config);
     result
 }
 
 pub fn config() -> &'static Config {
     CONFIG.get().expect("config not initialized")
+}
+
+/// The TrueType/OpenType font from `font`, or `None` for the built-in one.
+pub fn font() -> Option<&'static ab_glyph::FontVec> {
+    FONT.get().and_then(Option::as_ref)
+}
+
+fn load_font(path: &std::path::Path) -> anyhow::Result<ab_glyph::FontVec> {
+    let path = match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path.to_path_buf(),
+    };
+    let data = std::fs::read(&path)
+        .with_context(|| format!("Failed to read font at {}", path.display()))?;
+    ab_glyph::FontVec::try_from_vec(data)
+        .with_context(|| format!("Failed to parse font at {}", path.display()))
 }
 
 fn clamp_scale(scale: u32) -> u32 {
@@ -607,6 +633,9 @@ pub struct Config {
     pub macros: MacrosConfig,
     pub free: FreeConfig,
     pub hint: HintConfig,
+    /// Path to a TrueType/OpenType font (`.ttf`, `.otf`) for all text. Unset
+    /// uses the built-in 8x8 bitmap font.
+    pub font: Option<PathBuf>,
     pub font_size: u32,
     pub hint_font_size: Option<u32>,
     pub sub_hint_font_size: Option<u32>,
@@ -623,6 +652,7 @@ impl Default for Config {
             macros: MacrosConfig::default(),
             free: FreeConfig::default(),
             hint: HintConfig::default(),
+            font: None,
             font_size: 2,
             hint_font_size: None,
             sub_hint_font_size: None,
@@ -791,6 +821,14 @@ mod tests {
         }
         assert_eq!(keys.char_of(&KeyEvent::Char('z')), Some('z'));
         assert_eq!(KeyBindings::default().char_of(&KeyEvent::Click), None);
+    }
+
+    #[test]
+    fn unreadable_font_is_an_error() {
+        let err = load_font(std::path::Path::new("Cargo.toml")).unwrap_err();
+        assert!(err.to_string().contains("Failed to parse font"), "{err}");
+        let err = load_font(std::path::Path::new("/nonexistent.ttf")).unwrap_err();
+        assert!(err.to_string().contains("Failed to read font"), "{err}");
     }
 
     #[test]

@@ -20,6 +20,10 @@ fn glyph_scale_for_cell(cell_w: u32, cell_h: u32, requested_scale: u32) -> u32 {
 }
 
 fn glyph_bounds(ch: char) -> Option<(u32, u32, u32, u32)> {
+    if crate::config::font().is_some() {
+        // `draw_glyph` centres outline glyphs in their box itself.
+        return None;
+    }
     let glyph = font8x8::BASIC_FONTS.get(ch).unwrap_or([0u8; 8]);
     let mut min_x = 8u32;
     let mut max_x = 0u32;
@@ -647,8 +651,13 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Draws `ch` in the `8 * scale` square box at `(x, y)`.
     fn draw_glyph(&mut self, x: u32, y: u32, ch: char, color: [u8; 4], scale: u32) {
         if x + 8 * scale > self.w {
+            return;
+        }
+        if let Some(font) = crate::config::font() {
+            self.draw_outline_glyph(font, x, y, ch, color, 8 * scale);
             return;
         }
         let glyph = font8x8::BASIC_FONTS.get(ch).unwrap_or([0u8; 8]);
@@ -669,6 +678,50 @@ impl<'a> Canvas<'a> {
                 }
             }
         }
+    }
+
+    /// Rasterizes `ch` from `font` into the `size` square box, centred
+    /// horizontally, blending edges by coverage. The font is drawn larger than
+    /// the box and the x-height band is centred in it, so lowercase labels
+    /// read about as big as the bitmap font's, with ascenders and descenders
+    /// reaching into the padding around the box.
+    fn draw_outline_glyph(
+        &mut self,
+        font: &ab_glyph::FontVec,
+        x: u32,
+        y: u32,
+        ch: char,
+        color: [u8; 4],
+        size: u32,
+    ) {
+        use ab_glyph::{Font, ScaleFont};
+        let size = size as f32;
+        let scaled = font.as_scaled(size * 1.35);
+        let x_height = scaled
+            .outline_glyph(scaled.scaled_glyph('x'))
+            .map_or(size * 0.55, |x| x.px_bounds().height());
+        let Some(outline) = scaled.outline_glyph(scaled.scaled_glyph(ch)) else {
+            return; // whitespace or a char the font lacks
+        };
+        let bounds = outline.px_bounds();
+        let baseline = y as f32 + (size + x_height) / 2.0;
+        let left = x as f32 + (size - bounds.width()) / 2.0;
+        let top = baseline + bounds.min.y;
+        let h = (self.buf.len() / 4) as u32 / self.w.max(1);
+        outline.draw(|gx, gy, coverage| {
+            let (px, py) = (
+                left.round() as i64 + gx as i64,
+                top.round() as i64 + gy as i64,
+            );
+            if px < 0 || py < 0 || px >= self.w as i64 || py >= h as i64 {
+                return;
+            }
+            let off = (py as usize * self.w as usize + px as usize) * 4;
+            let coverage = coverage.clamp(0.0, 1.0);
+            for (dst, &src) in self.buf[off..off + 4].iter_mut().zip(&color) {
+                *dst = (*dst as f32 + (src as f32 - *dst as f32) * coverage).round() as u8;
+            }
+        });
     }
 
     fn draw_text(&mut self, x: u32, y: u32, text: &[u8], color: [u8; 4], scale: u32) {
