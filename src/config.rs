@@ -441,6 +441,21 @@ pub struct Colors {
     pub hint_text_typed: [u8; 4],
     #[serde(with = "from_hex")]
     pub hint_dim: [u8; 4],
+    /// Hint chip border. Unset uses `border`.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex")]
+    pub hint_border: Option<[u8; 4]>,
+}
+mod opt_hex {
+    use serde::{Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(color: &Option<[u8; 4]>, s: S) -> Result<S::Ok, S::Error> {
+        match color {
+            Some(color) => super::from_hex::serialize(color, s),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 4]>, D::Error> {
+        super::from_hex::deserialize(d).map(Some)
+    }
 }
 mod from_hex {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -502,6 +517,7 @@ impl Default for Colors {
             hint_text: [0x00, 0xCC, 0xFF, 0xFF],
             hint_text_typed: [0x50, 0xFF, 0x50, 0xFF],
             hint_dim: [0x66, 0x66, 0x66, 0x88],
+            hint_border: None,
         }
     }
 }
@@ -637,7 +653,14 @@ pub struct Config {
     /// uses the built-in 8x8 bitmap font.
     pub font: Option<PathBuf>,
     pub font_size: u32,
-    pub hint_font_size: Option<u32>,
+    /// Hint label size in steps of 8 px. Fractions (`1.25` = 10 px) need a
+    /// custom `font`; the bitmap font rounds down to a whole step.
+    pub hint_font_size: Option<f32>,
+    /// Space between a hint label's letters and its box edge, in px. Unset
+    /// is 4 px at the sides and 3 px above and below.
+    pub hint_padding: Option<u32>,
+    /// Corner radius of hint chips in px. 0 keeps them square.
+    pub hint_corner_radius: u32,
     pub sub_hint_font_size: Option<u32>,
     pub panel_font_size: Option<u32>,
 }
@@ -655,6 +678,8 @@ impl Default for Config {
             font: None,
             font_size: 2,
             hint_font_size: None,
+            hint_padding: None,
+            hint_corner_radius: 0,
             sub_hint_font_size: None,
             panel_font_size: None,
         }
@@ -688,8 +713,21 @@ impl Config {
         clamp_scale(self.font_size)
     }
 
-    pub fn hint_font_size(&self) -> u32 {
-        self.hint_font_size.map_or(1, clamp_scale)
+    /// Side of a hint label's glyph box in px.
+    pub fn hint_font_px(&self) -> u32 {
+        let (min, max) = (*SCALE_RANGE.start() as f32, *SCALE_RANGE.end() as f32);
+        let scale = self.hint_font_size.unwrap_or(1.0);
+        let scale = if scale.is_nan() {
+            1.0
+        } else {
+            scale.clamp(min, max)
+        };
+        (scale * 8.0).round() as u32
+    }
+
+    /// Hint label padding as `(horizontal, vertical)` px.
+    pub fn hint_padding(&self) -> (u32, u32) {
+        self.hint_padding.map_or((4, 3), |p| (p, p))
     }
 
     pub fn sub_hint_font_size(&self) -> u32 {
@@ -821,6 +859,22 @@ mod tests {
         }
         assert_eq!(keys.char_of(&KeyEvent::Char('z')), Some('z'));
         assert_eq!(KeyBindings::default().char_of(&KeyEvent::Click), None);
+    }
+
+    #[test]
+    fn hint_font_size_takes_whole_and_fractional_steps() {
+        let px = |toml: &str| toml::from_str::<Config>(toml).unwrap().hint_font_px();
+        assert_eq!(px(""), 8);
+        assert_eq!(px("hint_font_size = 3"), 24);
+        assert_eq!(px("hint_font_size = 1.25"), 10);
+        assert_eq!(px("hint_font_size = 0.5"), 8);
+    }
+
+    #[test]
+    fn hint_border_falls_back_to_border() {
+        assert_eq!(Config::default().colors.hint_border, None);
+        let config: Config = toml::from_str("[colors]\nhint_border = \"#5A3A2E\"\n").unwrap();
+        assert_eq!(config.colors.hint_border, Some([0x2E, 0x3A, 0x5A, 0xFF]));
     }
 
     #[test]

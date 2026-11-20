@@ -285,9 +285,13 @@ pub fn render_free(buf: &mut [u8], w: u32, h: u32, x: u32, y: u32, speed: u32) {
 pub fn render_hints(buf: &mut [u8], w: u32, h: u32, elements: &[HintElement], typed: &[char]) {
     let cfg = config();
     let colors = &cfg.colors;
-    let scale = cfg.hint_font_size();
-    let cw = char_width(scale);
-    let chip_h = 8 * scale + 6;
+    // Glyph box side in pixels. The bitmap font only scales in whole steps.
+    let mut cw = cfg.hint_font_px();
+    if crate::config::font().is_none() {
+        cw = cw / 8 * 8;
+    }
+    let pad = cfg.hint_padding();
+    let chip_h = cw + 2 * pad.1;
     let mut c = Canvas { buf, w };
     c.clear();
 
@@ -297,7 +301,7 @@ pub fn render_hints(buf: &mut [u8], w: u32, h: u32, elements: &[HintElement], ty
             8,
             b"no clickable elements found - esc to exit",
             colors.hint_text,
-            scale,
+            cw / 8,
         );
         return;
     }
@@ -308,7 +312,7 @@ pub fn render_hints(buf: &mut [u8], w: u32, h: u32, elements: &[HintElement], ty
     // nudged to the nearest free position instead of stacking unreadably.
     // On macOS every chip touches its click point instead, since AX boxes are
     // often far wider than the spot the click lands on.
-    let placements = place_chips(elements, w, h, chip_h, cw, cfg!(target_os = "macos"));
+    let placements = place_chips(elements, w, h, chip_h, cw, pad.0, cfg!(target_os = "macos"));
 
     // Layered draw: dimmed (non-matching) chips first, then the matching ones on
     // top, so a label you can still type is never hidden under a dimmed
@@ -322,7 +326,7 @@ pub fn render_hints(buf: &mut [u8], w: u32, h: u32, elements: &[HintElement], ty
             draw_hint_chip(
                 &mut c,
                 colors,
-                scale,
+                pad,
                 cw,
                 chip_h,
                 &elements[i],
@@ -354,12 +358,13 @@ fn place_chips(
     h: u32,
     chip_h: u32,
     cw: u32,
+    pad_x: u32,
     on_click_point: bool,
 ) -> Vec<(u32, u32, u32)> {
     let mut placed: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(elements.len());
     let mut out = Vec::with_capacity(elements.len());
     for el in elements {
-        let chip_w = (el.label.chars().count() as u32 * cw + 8).max(18);
+        let chip_w = (el.label.chars().count() as u32 * cw + 2 * pad_x).max(chip_h);
         let rect = if on_click_point {
             chip_at_point((el.cx, el.cy), chip_w, chip_h, w, h, &placed)
         } else {
@@ -481,7 +486,7 @@ fn rects_overlap(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32), gap: u32) -> 
 fn draw_hint_chip(
     c: &mut Canvas<'_>,
     colors: &crate::config::Colors,
-    scale: u32,
+    pad: (u32, u32),
     cw: u32,
     chip_h: u32,
     el: &HintElement,
@@ -509,13 +514,15 @@ fn draw_hint_chip(
             colors.hint_chip_bg[3] / 3,
         ]
     };
-    c.fill_rect(x, y, chip_w, chip_h, bg);
+    let radius = config().hint_corner_radius;
     // Border only on active chips — keeps dimmed neighbours visually quiet.
     if matching && chip_w > 2 && chip_h > 2 {
-        c.fill_rect(x, y, chip_w, 1, colors.border);
-        c.fill_rect(x, y + chip_h - 1, chip_w, 1, colors.border);
-        c.fill_rect(x, y, 1, chip_h, colors.border);
-        c.fill_rect(x + chip_w - 1, y, 1, chip_h, colors.border);
+        let border = colors.hint_border.unwrap_or(colors.border);
+        c.fill_round_rect(x, y, chip_w, chip_h, radius, border);
+        let inner = radius.saturating_sub(1);
+        c.fill_round_rect(x + 1, y + 1, chip_w - 2, chip_h - 2, inner, bg);
+    } else {
+        c.fill_round_rect(x, y, chip_w, chip_h, radius, bg);
     }
     for (idx, ch) in el.label.chars().enumerate() {
         let color = if matching && idx < typed.len() {
@@ -523,7 +530,7 @@ fn draw_hint_chip(
         } else {
             text_color
         };
-        c.draw_glyph(x + 4 + idx as u32 * cw, y + 3, ch, color, scale);
+        c.draw_glyph_px(x + pad.0 + idx as u32 * cw, y + pad.1, ch, color, cw);
     }
 }
 
@@ -639,6 +646,21 @@ impl<'a> Canvas<'a> {
         self.buf.fill(0);
     }
 
+    /// `fill_rect` with corners rounded to `radius`, row by row.
+    fn fill_round_rect(&mut self, x: u32, y: u32, w: u32, h: u32, radius: u32, color: [u8; 4]) {
+        let r = radius.min(w / 2).min(h / 2) as f32;
+        for dy in 0..h {
+            let d = dy.min(h - 1 - dy) as f32; // rows from the nearest edge
+            let inset = if d < r {
+                let t = r - d - 0.5;
+                (r - (r * r - t * t).sqrt()).round() as u32
+            } else {
+                0
+            };
+            self.fill_rect(x + inset, y + dy, w - 2 * inset, 1, color);
+        }
+    }
+
     fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
         for dy in 0..h {
             let row_start = ((y + dy) * self.w + x) as usize * 4;
@@ -677,6 +699,16 @@ impl<'a> Canvas<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Draws `ch` in the `px` square box at `(x, y)`: any size with a custom
+    /// font, the nearest smaller multiple of 8 with the bitmap one.
+    fn draw_glyph_px(&mut self, x: u32, y: u32, ch: char, color: [u8; 4], px: u32) {
+        match crate::config::font() {
+            Some(font) if x + px <= self.w => self.draw_outline_glyph(font, x, y, ch, color, px),
+            Some(_) => {}
+            None => self.draw_glyph(x, y, ch, color, (px / 8).max(1)),
         }
     }
 
@@ -953,7 +985,7 @@ mod tests {
         };
         let elements = vec![el("a"), el("s"), el("d")];
         let chip_h = 14;
-        let placements = place_chips(&elements, 1920, 1080, chip_h, 16, false);
+        let placements = place_chips(&elements, 1920, 1080, chip_h, 16, 4, false);
         let rects: Vec<(u32, u32, u32, u32)> = placements
             .iter()
             .map(|&(x, y, cw)| (x, y, cw, chip_h))
@@ -989,7 +1021,7 @@ mod tests {
 
     /// Click-point chips, each checked to stay on screen and touch its point.
     fn anchored_chips(elements: &[HintElement]) -> Vec<Rect> {
-        let rects: Vec<Rect> = place_chips(elements, W, H, CHIP_H, CW, true)
+        let rects: Vec<Rect> = place_chips(elements, W, H, CHIP_H, CW, 4, true)
             .into_iter()
             .map(|(x, y, chip_w)| (x, y, chip_w, CHIP_H))
             .collect();
