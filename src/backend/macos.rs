@@ -267,6 +267,9 @@ pub struct MacosBackend {
     view: Retained<NSView>,
     screen_w: u32,
     screen_h: u32,
+    /// Backing scale of the main screen (2 on Retina); the overlay image is
+    /// this many times larger than the screen in points on each axis.
+    scale: u32,
     visible: bool,
     current_image: Option<CGImageHandle>,
     event_source: CGEventSourceHandle,
@@ -337,6 +340,7 @@ impl MacosBackend {
         let main_screen = NSScreen::mainScreen(mtm)
             .ok_or_else(|| anyhow!("NSScreen::mainScreen returned nil"))?;
         let screen_frame = main_screen.frame();
+        let scale = main_screen.backingScaleFactor().round().max(1.0) as u32;
 
         let window: Retained<OverlayWindow> = unsafe {
             let alloc = OverlayWindow::alloc(mtm);
@@ -384,6 +388,8 @@ impl MacosBackend {
                 let _: () = msg_send![&*layer, setGeometryFlipped: true];
                 let gravity = NSString::from_str("resize");
                 let _: () = msg_send![&*layer, setContentsGravity: &*gravity];
+                // The image is drawn at device pixels, so it maps 1:1.
+                let _: () = msg_send![&*layer, setContentsScale: scale as f64];
             }
         }
         window.setContentView(Some(&view));
@@ -437,6 +443,7 @@ impl MacosBackend {
             view,
             screen_w,
             screen_h,
+            scale,
             visible: true,
             current_image: None,
             event_source: CGEventSourceHandle(event_source),
@@ -555,7 +562,12 @@ impl Backend for MacosBackend {
         (self.screen_w, self.screen_h)
     }
 
+    fn pixel_scale(&self) -> u32 {
+        self.scale
+    }
+
     fn present(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()> {
+        let (width, height) = (width * self.scale, height * self.scale);
         if !self.visible {
             self.show_overlay();
         }

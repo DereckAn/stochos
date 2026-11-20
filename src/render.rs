@@ -4,6 +4,7 @@ use crate::{
     input::InputState,
 };
 use font8x8::UnicodeFonts;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 fn line_height(scale: u32) -> u32 {
     8 * scale + 8
@@ -75,7 +76,7 @@ fn subdivide_span(start: u32, span: u32, index: u32, count: u32) -> (u32, u32) {
 
 pub fn render_grid(buf: &mut [u8], w: u32, h: u32, input: &InputState, dragging: bool) {
     let cfg = config();
-    let mut c = Canvas { buf, w };
+    let mut c = Canvas::new(buf, w);
     c.clear();
     match input {
         InputState::SubFirst { col, row } => {
@@ -153,7 +154,7 @@ pub fn render_bisect(buf: &mut [u8], w: u32, h: u32, region: (u32, u32, u32, u32
     let cols = bcfg.cols.max(1);
     let (rx, ry, rw, rh) = region;
     let colors = &cfg.colors;
-    let mut c = Canvas { buf, w };
+    let mut c = Canvas::new(buf, w);
     c.clear();
 
     let rx = rx.min(w);
@@ -214,7 +215,7 @@ pub fn render_rec_indicator(buf: &mut [u8], w: u32) {
     let cfg = config();
     let scale = cfg.font_size();
     let colors = &cfg.colors;
-    let mut c = Canvas { buf, w };
+    let mut c = Canvas::new(buf, w);
     c.fill_rect(8, 8, 8 * scale * 4, line_height(scale), colors.rec_bg);
     c.draw_text(12, 12, b"REC", colors.text_white, scale);
 }
@@ -222,7 +223,7 @@ pub fn render_rec_indicator(buf: &mut [u8], w: u32) {
 pub fn render_free(buf: &mut [u8], w: u32, h: u32, x: u32, y: u32, speed: u32) {
     let cfg = config();
     let colors = &cfg.colors;
-    let mut c = Canvas { buf, w };
+    let mut c = Canvas::new(buf, w);
     c.clear();
 
     // Crosshair centered on the cursor position.
@@ -292,7 +293,7 @@ pub fn render_hints(buf: &mut [u8], w: u32, h: u32, elements: &[HintElement], ty
     }
     let pad = cfg.hint_padding();
     let chip_h = cw + 2 * pad.1;
-    let mut c = Canvas { buf, w };
+    let mut c = Canvas::new(buf, w);
     c.clear();
 
     if elements.is_empty() {
@@ -636,19 +637,42 @@ pub fn render_macro_search(
         .text(b"tab:next enter:select esc:back", colors.text_grey);
 }
 
+static PIXEL_SCALE: AtomicU32 = AtomicU32::new(1);
+
+/// Sets how many device pixels each screen unit spans on each axis, as
+/// reported by `Backend::pixel_scale`. Render buffers must be sized to match.
+pub fn set_pixel_scale(scale: u32) {
+    PIXEL_SCALE.store(scale.max(1), Ordering::Relaxed);
+}
+
+/// Draws in screen units, `w` wide, into a buffer `s` times denser on each
+/// axis, so text and edges stay sharp on HiDPI screens.
 struct Canvas<'a> {
     buf: &'a mut [u8],
     w: u32,
+    s: u32,
 }
 
 impl<'a> Canvas<'a> {
+    fn new(buf: &'a mut [u8], w: u32) -> Self {
+        let s = PIXEL_SCALE.load(Ordering::Relaxed);
+        Self { buf, w, s }
+    }
+
+    /// Buffer row length in device pixels.
+    fn stride(&self) -> u32 {
+        self.w * self.s
+    }
+
     fn clear(&mut self) {
         self.buf.fill(0);
     }
 
-    /// `fill_rect` with corners rounded to `radius`, row by row.
+    /// `fill_rect` with corners rounded to `radius`, row by device-pixel row.
     fn fill_round_rect(&mut self, x: u32, y: u32, w: u32, h: u32, radius: u32, color: [u8; 4]) {
-        let r = radius.min(w / 2).min(h / 2) as f32;
+        let s = self.s;
+        let (x, y, w, h) = (x * s, y * s, w * s, h * s);
+        let r = (radius * s).min(w / 2).min(h / 2) as f32;
         for dy in 0..h {
             let d = dy.min(h - 1 - dy) as f32; // rows from the nearest edge
             let inset = if d < r {
@@ -657,13 +681,20 @@ impl<'a> Canvas<'a> {
             } else {
                 0
             };
-            self.fill_rect(x + inset, y + dy, w - 2 * inset, 1, color);
+            self.fill_px(x + inset, y + dy, w - 2 * inset, 1, color);
         }
     }
 
     fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
+        let s = self.s;
+        self.fill_px(x * s, y * s, w * s, h * s, color);
+    }
+
+    /// `fill_rect` in device pixels.
+    fn fill_px(&mut self, x: u32, y: u32, w: u32, h: u32, color: [u8; 4]) {
+        let stride = self.stride();
         for dy in 0..h {
-            let row_start = ((y + dy) * self.w + x) as usize * 4;
+            let row_start = ((y + dy) * stride + x) as usize * 4;
             let row_end = row_start + w as usize * 4;
             if row_end <= self.buf.len() {
                 for px in self.buf[row_start..row_end].as_chunks_mut::<4>().0 {
@@ -682,12 +713,14 @@ impl<'a> Canvas<'a> {
             self.draw_outline_glyph(font, x, y, ch, color, 8 * scale);
             return;
         }
+        let (x, y, scale) = (x * self.s, y * self.s, scale * self.s);
+        let stride = self.stride();
         let glyph = font8x8::BASIC_FONTS.get(ch).unwrap_or([0u8; 8]);
         let x_end_bytes = (x + 8 * scale) as usize * 4;
         for (row, &bits) in glyph.iter().enumerate() {
             for sy in 0..scale {
                 let py = y + row as u32 * scale + sy;
-                let row_off = (py * self.w) as usize * 4;
+                let row_off = (py * stride) as usize * 4;
                 if row_off + x_end_bytes <= self.buf.len() {
                     for col in 0..8u32 {
                         if bits & (1 << col) != 0 {
@@ -727,7 +760,8 @@ impl<'a> Canvas<'a> {
         size: u32,
     ) {
         use ab_glyph::{Font, ScaleFont};
-        let size = size as f32;
+        let s = self.s as f32;
+        let (x, y, size) = (x as f32 * s, y as f32 * s, size as f32 * s);
         let scaled = font.as_scaled(size * 1.35);
         let x_height = scaled
             .outline_glyph(scaled.scaled_glyph('x'))
@@ -736,19 +770,20 @@ impl<'a> Canvas<'a> {
             return; // whitespace or a char the font lacks
         };
         let bounds = outline.px_bounds();
-        let baseline = y as f32 + (size + x_height) / 2.0;
-        let left = x as f32 + (size - bounds.width()) / 2.0;
+        let baseline = y + (size + x_height) / 2.0;
+        let left = x + (size - bounds.width()) / 2.0;
         let top = baseline + bounds.min.y;
-        let h = (self.buf.len() / 4) as u32 / self.w.max(1);
+        let stride = self.stride();
+        let h = (self.buf.len() / 4) as u32 / stride.max(1);
         outline.draw(|gx, gy, coverage| {
             let (px, py) = (
                 left.round() as i64 + gx as i64,
                 top.round() as i64 + gy as i64,
             );
-            if px < 0 || py < 0 || px >= self.w as i64 || py >= h as i64 {
+            if px < 0 || py < 0 || px >= stride as i64 || py >= h as i64 {
                 return;
             }
-            let off = (py as usize * self.w as usize + px as usize) * 4;
+            let off = (py as usize * stride as usize + px as usize) * 4;
             let coverage = coverage.clamp(0.0, 1.0);
             for (dst, &src) in self.buf[off..off + 4].iter_mut().zip(&color) {
                 *dst = (*dst as f32 + (src as f32 - *dst as f32) * coverage).round() as u8;
@@ -789,7 +824,7 @@ impl<'a> Panel<'a> {
 
     fn with_cols(buf: &'a mut [u8], w: u32, h: u32, rows: u32, cols: u32) -> Self {
         let cfg = config();
-        let mut c = Canvas { buf, w };
+        let mut c = Canvas::new(buf, w);
         c.clear();
         let scale = cfg.panel_font_size();
         let lh = line_height(scale);
@@ -1082,5 +1117,35 @@ mod tests {
             el((W - 1, H - 1, 1, 1), "g"),
         ];
         anchored_chips(&elements);
+    }
+}
+
+#[cfg(test)]
+mod pixel_scale_tests {
+    use super::Canvas;
+
+    /// Draws a box and a bitmap glyph on a 16x12 canvas at device scale `s`.
+    fn draw(s: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; (16 * s * 12 * s * 4) as usize];
+        let mut c = Canvas {
+            buf: &mut buf,
+            w: 16,
+            s,
+        };
+        c.fill_rect(1, 1, 14, 10, [1, 2, 3, 4]);
+        c.draw_glyph(4, 2, 'a', [9, 9, 9, 9], 1);
+        buf
+    }
+
+    #[test]
+    fn double_scale_is_the_same_image_at_twice_the_density() {
+        let (one, two) = (draw(1), draw(2));
+        for y in 0..24usize {
+            for x in 0..32usize {
+                let a = &one[((y / 2) * 16 + x / 2) * 4..][..4];
+                let b = &two[(y * 32 + x) * 4..][..4];
+                assert_eq!(a, b, "device pixel ({x}, {y})");
+            }
+        }
     }
 }

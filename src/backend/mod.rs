@@ -44,7 +44,16 @@ pub trait Backend {
     /// Screen dimensions in pixels.
     fn screen_size(&self) -> (u32, u32);
 
-    /// Display a rendered ARGB8888 pixel buffer on the overlay.
+    /// Device pixels per `screen_size` unit on each axis, e.g. 2 on a Retina
+    /// display. Only the overlay buffer is drawn at this density; every
+    /// coordinate passed to or from the backend stays in `screen_size` units.
+    fn pixel_scale(&self) -> u32 {
+        1
+    }
+
+    /// Display a rendered ARGB8888 pixel buffer on the overlay. `width` and
+    /// `height` are in `screen_size` units; `pixels` holds
+    /// `width * height * pixel_scale()²` pixels.
     fn present(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()>;
 
     /// Query the current mouse pointer position.

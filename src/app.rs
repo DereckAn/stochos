@@ -21,7 +21,9 @@ pub fn run<B: Backend>(
     config_error: Option<anyhow::Error>,
 ) -> anyhow::Result<()> {
     let (w, h) = backend.screen_size();
-    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let scale = backend.pixel_scale();
+    crate::render::set_pixel_scale(scale);
+    let mut pixels = vec![0u8; (w * scale * h * scale * 4) as usize];
 
     if let Some(error) = config_error {
         render_config_error(&mut pixels, w, h, &error);
