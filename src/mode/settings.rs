@@ -76,6 +76,19 @@ const FIELDS: &[Field] = &[
         read: |c| Value::Color(c.colors.border),
         color: Some(|c| &mut c.border),
     },
+    Field {
+        label: "better detection",
+        path: &["hint", "improved_detection"],
+        read: |c| Value::Toggle(c.hint.improved_detection),
+        color: None,
+    },
+    // Only changes anything in a build made with `--features opencv`.
+    Field {
+        label: "use opencv",
+        path: &["hint", "use_opencv"],
+        read: |c| Value::Toggle(c.hint.use_opencv),
+        color: None,
+    },
 ];
 
 #[derive(Clone)]
@@ -300,6 +313,8 @@ mod tests {
                 Value::Color([0x7A, 0xB0, 0xFF, 0xFF]),
             ),
             (&["hint", "auto_click"][..], Value::Toggle(true)),
+            (&["hint", "improved_detection"][..], Value::Toggle(false)),
+            (&["hint", "use_opencv"][..], Value::Toggle(false)),
         ];
         let out = apply_edits(text, edits.into_iter()).unwrap();
         assert!(
@@ -312,6 +327,8 @@ mod tests {
         assert_eq!(parsed.hint_font_px(), 16);
         assert_eq!(parsed.colors.hint_text, [0x7A, 0xB0, 0xFF, 0xFF]);
         assert!(parsed.hint.auto_click);
+        assert!(!parsed.hint.improved_detection);
+        assert!(!parsed.hint.use_opencv);
     }
 
     #[test]
