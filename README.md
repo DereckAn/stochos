@@ -37,6 +37,7 @@ cargo build --release                                          # Linux: both bac
 cargo build --release --no-default-features --features wayland # Wayland only
 cargo build --release --no-default-features --features x11     # X11 only
 cargo build --release --no-default-features                    # macOS
+cargo build --release --features opencv                        # faster, more detailed hint detection (needs OpenCV 4/5 + a C++ compiler)
 ```
 
 ## Setup
@@ -301,6 +302,7 @@ max_speed = 500
 - `alphabet` sets the characters used for generated hint labels. Defaults to the same set as `[grid].hints`; override to change which keys label elements.
 - `max_label_len` caps generated label length. Higher values allow more targets, but require more keystrokes.
 - `auto_click` clicks as soon as the typed label uniquely matches one target. Leave it `false` if you want to choose the action after selecting.
+- Building with `--features opencv` runs the improved detector's per-pixel work with OpenCV, at the full capture resolution: about 2x faster and more targets on HiDPI screens. The binary then depends on the system OpenCV, so an OpenCV upgrade means rebuilding stochos.
 - `improved_detection` picks the CV detector. `true` (default) works at the logical screen resolution and finds far more small targets (about 60 ms on a 4K capture at 1.5x scale); `false` restores the original detector, which is faster but misses most text links and small icons.
 - `downscale_longest` controls the original detector's speed/precision (`improved_detection = false`). Lower values are faster but less precise; `0` disables downscaling.
 - `edge_low_threshold` / `edge_high_threshold` tune Canny edge detection. Lower values find more targets and more false positives; higher values are stricter.

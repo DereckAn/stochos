@@ -75,8 +75,9 @@ fn detect_improved(
 
     let cfg = &config().hint;
     // Work at the logical resolution: HiDPI captures carry no extra UI, only
-    // sharper pixels, and the smaller image is much faster.
-    let scale = if logical_w > 0 && logical_w < capture_w {
+    // sharper pixels, and the smaller image is much faster. OpenCV is fast
+    // enough to use the full capture, where small targets stay separate.
+    let scale = if !cfg!(feature = "opencv") && logical_w > 0 && logical_w < capture_w {
         logical_w as f32 / capture_w as f32
     } else {
         1.0
@@ -84,27 +85,22 @@ fn detect_improved(
     let ww = ((capture_w as f32 * scale).round() as u32).max(1);
     let wh = ((capture_h as f32 * scale).round() as u32).max(1);
     // Working pixels per logical pixel (1 when the capture is HiDPI or 1x).
-    let k = if logical_w > capture_w {
-        capture_w as f32 / logical_w as f32
+    let k = if logical_w > 0 {
+        ww as f32 / logical_w as f32
     } else {
         1.0
     };
 
     let gray = grayscale_resized(bgra, capture_w as usize, capture_h as usize, ww, wh);
-    let edges = fast_canny(
+    // Wider than tall: the letters of a word (and an icon next to its label)
+    // join into one target, while lines of text stay separate.
+    let components = edge_components(
         &gray,
         cfg.edge_low_threshold as f32,
         cfg.edge_high_threshold as f32,
-    );
-    // Wider than tall: the letters of a word (and an icon next to its label)
-    // join into one target, while lines of text stay separate.
-    let joined = dilate_rect(
-        &edges,
         ((3.5 * k).round() as u32).max(1),
         ((2.5 * k).round() as u32).max(1),
     );
-
-    let components = connected_component_boxes(&joined);
 
     // Size limits in logical px. Below: specks, underlines and separators.
     // Above: panels, paragraphs and bars, which are containers, not targets.
@@ -143,11 +139,61 @@ fn detect_improved(
         .collect())
 }
 
+/// Canny edges, dilated by a `kw` x `kh` rectangle, as connected components.
+#[cfg(not(feature = "opencv"))]
+fn edge_components(gray: &GrayImage, low: f32, high: f32, kw: u32, kh: u32) -> Vec<Component> {
+    connected_component_boxes(&dilate_rect(&fast_canny(gray, low, high), kw, kh))
+}
+
+/// Same as the pure-Rust version, with OpenCV doing the per-pixel work.
+/// OpenCV's hysteresis follows all 8 neighbours (imageproc's follows 6), so it
+/// keeps a few more faint edges.
+#[cfg(feature = "opencv")]
+fn edge_components(gray: &GrayImage, low: f32, high: f32, kw: u32, kh: u32) -> Vec<Component> {
+    unsafe extern "C" {
+        fn stochos_cv_components(
+            gray: *const u8,
+            w: i32,
+            h: i32,
+            low: f64,
+            high: f64,
+            kw: i32,
+            kh: i32,
+            out: *mut i32,
+            max_out: i32,
+        ) -> i32;
+    }
+    const MAX: usize = 20_000;
+    let mut out = vec![0i32; MAX * 5];
+    // SAFETY: `gray` holds w*h bytes and `out` MAX*5 ints, as the C side expects.
+    let n = unsafe {
+        stochos_cv_components(
+            gray.as_raw().as_ptr(),
+            gray.width() as i32,
+            gray.height() as i32,
+            f64::from(low),
+            f64::from(high),
+            kw as i32,
+            kh as i32,
+            out.as_mut_ptr(),
+            MAX as i32,
+        )
+    };
+    out.chunks_exact(5)
+        .take(n.max(0) as usize)
+        .map(|c| Component {
+            bbox: (c[0] as u32, c[1] as u32, c[2] as u32, c[3] as u32),
+            pixels: c[4] as u32,
+        })
+        .collect()
+}
+
 /// Canny edge detection, same steps and thresholds as `imageproc::edges::canny`
 /// (Gaussian blur with sigma 1.4, 3x3 Sobel, non-maximum suppression,
 /// hysteresis) but in integers with direct indexing and no per-pixel `atan2`:
 /// about 3x faster, which is what lets the improved detector run at the logical
 /// screen resolution. Magnitudes are compared squared, which keeps their order.
+#[cfg_attr(feature = "opencv", allow(dead_code))] // tests still use it
 fn fast_canny(image: &GrayImage, low_threshold: f32, high_threshold: f32) -> GrayImage {
     let (w, h) = (image.width() as usize, image.height() as usize);
     if w < 3 || h < 3 {
@@ -158,6 +204,7 @@ fn fast_canny(image: &GrayImage, low_threshold: f32, high_threshold: f32) -> Gra
 }
 
 /// Sobel, non-maximum suppression and hysteresis on an already blurred image.
+#[cfg_attr(feature = "opencv", allow(dead_code))] // tests still use it
 fn canny_after_blur(
     blurred: &[u8],
     w: usize,
@@ -251,6 +298,7 @@ fn canny_after_blur(
 /// Separable 7-tap Gaussian (sigma 1.4, as imageproc's kernel), replicated
 /// borders, fixed-point weights summing to 4096. Each pass truncates to u8
 /// like imageproc does; rounding instead loses faint dark-theme edges.
+#[cfg_attr(feature = "opencv", allow(dead_code))] // tests still use it
 fn gaussian_blur_7(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     const SIGMA: f32 = 1.4;
     let raw: Vec<f32> = (-3..=3i32)
@@ -303,6 +351,7 @@ fn gaussian_blur_7(src: &[u8], w: usize, h: usize) -> Vec<u8> {
 
 /// Binary dilation by a `kw` x `kh` rectangle centered on each pixel
 /// (separable; a running count per line keeps it O(pixels)).
+#[cfg_attr(feature = "opencv", allow(dead_code))] // tests still use it
 fn dilate_rect(mask: &GrayImage, kw: u32, kh: u32) -> GrayImage {
     let (w, h) = (mask.width() as usize, mask.height() as usize);
     let rows = dilate_lines(mask.as_raw(), w, h, 1, w, kw as usize);
@@ -312,6 +361,7 @@ fn dilate_rect(mask: &GrayImage, kw: u32, kh: u32) -> GrayImage {
 
 /// Dilate `count` lines of `len` pixels; pixel `i` of line `l` is at
 /// `l * line_step + i * step`.
+#[cfg_attr(feature = "opencv", allow(dead_code))] // tests still use it
 fn dilate_lines(
     src: &[u8],
     len: usize,

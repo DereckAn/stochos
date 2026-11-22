@@ -15,6 +15,8 @@ exclude = ["example.gif", "target/*", "nix/*", "flake.*", "shell.nix", "install.
 default = ["wayland", "x11"]
 wayland = ["dep:wayland-client", "dep:wayland-protocols-wlr", "dep:tempfile", "dep:xkbcommon"]
 x11 = ["dep:x11rb", "dep:xkbcommon"]
+# Run the CV detector's per-pixel stages with OpenCV (needs OpenCV 4/5 and a C++ compiler).
+opencv = ["dep:cc"]
 
 [dependencies]
 anyhow = "1.0"
@@ -44,3 +46,6 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSColor", "NSEv
 objc2-application-services = { version = "0.3", default-features = false, features = ["std", "libc", "AXUIElement", "AXValue", "AXAttributeConstants", "AXRoleConstants", "AXError", "HIServices"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGDirectDisplay", "CGImage", "CGDataProvider", "CGError"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFString", "CFArray", "CFData", "CFBase", "CFCGTypes", "CFNumber"] }
+
+[build-dependencies]
+cc = { version = "1.2", optional = true }
