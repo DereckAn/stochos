@@ -1548,6 +1548,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "toml_edit",
  "wayland-client",
  "wayland-protocols-wlr",
  "x11rb",
@@ -1617,6 +1618,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
