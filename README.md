@@ -37,6 +37,7 @@ cargo build --release                                          # Linux: both bac
 cargo build --release --no-default-features --features wayland # Wayland only
 cargo build --release --no-default-features --features x11     # X11 only
 cargo build --release --no-default-features                    # macOS
+cargo build --release --features opencv                        # faster, more detailed hint detection (needs OpenCV 4/5 + a C++ compiler)
 ```
 
 ## Setup
@@ -145,7 +146,7 @@ An alternative mode that labels likely clickable UI targets directly, instead of
 Detection is pluggable behind a `HintDetector` trait, selected by `hint.detector`:
 
 - **`atspi`** (Linux, built in): reads the desktop [AT-SPI](https://docs.rs/atspi) accessibility tree over D-Bus and labels interactive elements using their roles and bounds. It is usually the most accurate detector. GTK, Qt, and Gecko apps tend to work well; Chromium/Electron may need accessibility enabled; games and canvas-heavy apps may expose little or nothing. On Wayland, exact placement requires compositor support; Hyprland and Sway are supported. On X11, coordinates are already absolute. Only the primary monitor is handled.
-- **`cv`** (always available): a pure-Rust computer-vision pass over a screenshot — resize to the logical screen resolution → Canny edges → wider-than-tall dilation (joins the letters of a word, keeps lines apart) → connected components → size filtering in logical pixels → drop boxes nested inside a control, with a per-box quality score. No model, no network, no services to talk to. CV sees visual *structure*, not semantic clickability, so it will still occasionally label a border, separator, or decorative shape, and miss a low-contrast control. Tune `edge_low_threshold`/`edge_high_threshold` (raise to cut clutter, lower to catch faint controls).
+- **`cv`** (always available): a pure-Rust computer-vision pass over a screenshot — resize to the logical screen resolution → Canny edges → wider-than-tall dilation (joins the letters of a word, keeps lines apart) → connected components → size filtering in logical pixels → drop boxes nested inside a control, with a per-box quality score (set `improved_detection = false` for the original pipeline: downscale → Canny → morphological closing → connected components → resolution-relative size filtering). No model, no network, no services to talk to. CV sees visual *structure*, not semantic clickability, so it will still occasionally label a border, separator, or decorative shape, and miss a low-contrast control. Tune `edge_low_threshold`/`edge_high_threshold` (raise to cut clutter, lower to catch faint controls).
 - **`auto`** (default): tries AT-SPI first and falls back to CV when needed. If an app exposes window chrome but not content, CV labels the unhandled content area. On macOS it reads the Accessibility API instead, and runs CV only when that finds too few targets, limited to the focused window.
 
 ```toml
@@ -210,7 +211,8 @@ detector = "auto"  # "auto" (default) | "atspi" (Linux) | "cv"
 alphabet = ["a", "s", "d", "f", "j", "k", "l", ";", "g", "h", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]  # Keys used to build hint labels
 max_label_len = 3
 auto_click = false  # If true, click immediately when a typed label uniquely identifies a target
-downscale_longest = 1280  # CV: longest screen-capture side fed to the detector; 0 = no downscale
+improved_detection = true  # CV: improved detector (more small targets); false = the original one
+downscale_longest = 1280  # CV (original detector only): longest screen-capture side fed to the detector; 0 = no downscale
 edge_low_threshold = 50  # CV: Canny low threshold (raise to cut clutter, lower to catch faint controls)
 edge_high_threshold = 150  # CV: Canny high threshold
 
@@ -300,7 +302,9 @@ max_speed = 500
 - `alphabet` sets the characters used for generated hint labels. Defaults to the same set as `[grid].hints`; override to change which keys label elements.
 - `max_label_len` caps generated label length. Higher values allow more targets, but require more keystrokes.
 - `auto_click` clicks as soon as the typed label uniquely matches one target. Leave it `false` if you want to choose the action after selecting.
-- `downscale_longest` caps the CV detector's working resolution (it never works above the logical screen size). Lower values are faster but miss tiny controls; raise it to your logical width (e.g. `2560`) to catch small icons and chevrons, at roughly 4x the detection time. `0` removes the cap.
+- Building with `--features opencv` runs the improved detector's per-pixel work with OpenCV, at the full capture resolution: about 2x faster and more targets on HiDPI screens. The binary then depends on the system OpenCV, so an OpenCV upgrade means rebuilding stochos.
+- `improved_detection` picks the CV detector. `true` (default) works at the logical screen resolution and finds far more small targets (about 60 ms on a 4K capture at 1.5x scale); `false` restores the original detector, which is faster but misses most text links and small icons.
+- `downscale_longest` controls the original detector's speed/precision (`improved_detection = false`). Lower values are faster but less precise; `0` disables downscaling.
 - `edge_low_threshold` / `edge_high_threshold` tune Canny edge detection. Lower values find more targets and more false positives; higher values are stricter.
 
 ### Free mode

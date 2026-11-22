@@ -619,12 +619,19 @@ pub enum HintDetectorKind {
 pub struct HintConfig {
     /// Which detector to use: "auto" (default), "cv", or "atspi".
     pub detector: HintDetectorKind,
+    /// CV detector version. `true` (default): works at the logical screen
+    /// resolution, joins a word's letters into one target and filters by size
+    /// in logical pixels, so it finds far more small targets. `false`: the
+    /// original detector, unchanged.
+    pub improved_detection: bool,
     pub alphabet: Vec<char>,
     pub max_label_len: usize,
     pub auto_click: bool,
-    /// Longest screen-capture side fed to the CV detector; the result is
-    /// scaled back to screen coordinates. 0 disables downscaling. Bounds both
-    /// runtime and the absolute size of filtered features.
+    /// Longest screen-capture side fed to the original CV detector
+    /// (`improved_detection = false`); the result is scaled back to screen
+    /// coordinates. 0 disables downscaling. Bounds both runtime and the
+    /// absolute size of filtered features. The improved detector always works
+    /// at the logical screen resolution.
     pub downscale_longest: u32,
     /// Canny edge thresholds for the CV detector. Raise them for fewer, more
     /// confident hints on noisy screens; lower them to catch faint controls.
@@ -636,6 +643,7 @@ impl Default for HintConfig {
     fn default() -> Self {
         Self {
             detector: HintDetectorKind::default(),
+            improved_detection: true,
             alphabet: vec![
                 'a', 's', 'd', 'f', 'j', 'k', 'l', ';', 'g', 'h', 'q', 'w', 'e', 'r', 't', 'y',
                 'u', 'i', 'o', 'p',

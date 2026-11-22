@@ -1531,6 +1531,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "atspi",
+ "cc",
  "clap",
  "font8x8",
  "futures-executor",
