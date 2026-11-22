@@ -572,6 +572,10 @@ pub struct HintConfig {
     /// in logical pixels, so it finds far more small targets. `false`: the
     /// original detector, unchanged.
     pub improved_detection: bool,
+    /// Run the improved detector's per-pixel work with OpenCV, at the full
+    /// capture resolution (faster, more targets). Only takes effect in a build
+    /// made with `--features opencv`; otherwise the pure-Rust path runs.
+    pub use_opencv: bool,
     pub alphabet: Vec<char>,
     pub max_label_len: usize,
     pub auto_click: bool,
@@ -592,6 +596,7 @@ impl Default for HintConfig {
         Self {
             detector: HintDetectorKind::default(),
             improved_detection: true,
+            use_opencv: true,
             alphabet: vec![
                 'a', 's', 'd', 'f', 'j', 'k', 'l', ';', 'g', 'h', 'q', 'w', 'e', 'r', 't', 'y',
                 'u', 'i', 'o', 'p',
