@@ -7,10 +7,7 @@
 
 use anyhow::{bail, Context};
 use image::{GrayImage, Luma};
-use imageproc::{
-    edges::canny,
-    region_labelling::{connected_components, Connectivity},
-};
+use imageproc::region_labelling::{connected_components, Connectivity};
 use std::collections::HashMap;
 
 use super::detect::{DetectorOutput, HintCandidate, HintDetector};
@@ -46,10 +43,24 @@ struct Component {
     pixels: u32,
 }
 
-/// `logical_w` is the screen width in logical (scaled) pixels, so size limits
-/// mean the same thing on a 1080p screen and a HiDPI one; 0 treats capture
-/// pixels as logical.
+/// Run the detector chosen by `hint.improved_detection`.
 fn detect_candidates_cv(
+    bgra: &[u8],
+    capture_w: u32,
+    capture_h: u32,
+    logical_w: u32,
+) -> anyhow::Result<Vec<HintCandidate>> {
+    if config().hint.improved_detection {
+        detect_improved(bgra, capture_w, capture_h, logical_w)
+    } else {
+        detect_classic(bgra, capture_w, capture_h)
+    }
+}
+
+/// The improved detector. `logical_w` is the screen width in logical (scaled)
+/// pixels, so size limits mean the same thing on a 1080p screen and a HiDPI
+/// one; 0 treats capture pixels as logical.
+fn detect_improved(
     bgra: &[u8],
     capture_w: u32,
     capture_h: u32,
@@ -65,26 +76,22 @@ fn detect_candidates_cv(
     let cfg = &config().hint;
     // Work at the logical resolution: HiDPI captures carry no extra UI, only
     // sharper pixels, and the smaller image is much faster.
-    let mut scale = if logical_w > 0 && logical_w < capture_w {
+    let scale = if logical_w > 0 && logical_w < capture_w {
         logical_w as f32 / capture_w as f32
     } else {
         1.0
     };
-    let longest = capture_w.max(capture_h) as f32 * scale;
-    if cfg.downscale_longest > 0 && longest > cfg.downscale_longest as f32 {
-        scale *= cfg.downscale_longest as f32 / longest;
-    }
     let ww = ((capture_w as f32 * scale).round() as u32).max(1);
     let wh = ((capture_h as f32 * scale).round() as u32).max(1);
-    // Working pixels per logical pixel: 1 unless `downscale_longest` capped it.
-    let k = if logical_w > 0 {
-        scale * capture_w as f32 / logical_w as f32
+    // Working pixels per logical pixel (1 when the capture is HiDPI or 1x).
+    let k = if logical_w > capture_w {
+        capture_w as f32 / logical_w as f32
     } else {
-        scale
+        1.0
     };
 
     let gray = grayscale_resized(bgra, capture_w as usize, capture_h as usize, ww, wh);
-    let edges = canny(
+    let edges = fast_canny(
         &gray,
         cfg.edge_low_threshold as f32,
         cfg.edge_high_threshold as f32,
@@ -136,6 +143,164 @@ fn detect_candidates_cv(
         .collect())
 }
 
+/// Canny edge detection, same steps and thresholds as `imageproc::edges::canny`
+/// (Gaussian blur with sigma 1.4, 3x3 Sobel, non-maximum suppression,
+/// hysteresis) but in integers with direct indexing and no per-pixel `atan2`:
+/// about 3x faster, which is what lets the improved detector run at the logical
+/// screen resolution. Magnitudes are compared squared, which keeps their order.
+fn fast_canny(image: &GrayImage, low_threshold: f32, high_threshold: f32) -> GrayImage {
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    if w < 3 || h < 3 {
+        return GrayImage::new(w as u32, h as u32);
+    }
+    let blurred = gaussian_blur_7(image.as_raw(), w, h);
+    canny_after_blur(&blurred, w, h, low_threshold, high_threshold)
+}
+
+/// Sobel, non-maximum suppression and hysteresis on an already blurred image.
+fn canny_after_blur(
+    blurred: &[u8],
+    w: usize,
+    h: usize,
+    low_threshold: f32,
+    high_threshold: f32,
+) -> GrayImage {
+    let mut out = GrayImage::new(w as u32, h as u32);
+
+    // 3x3 Sobel, magnitude squared. Border pixels never reach the output
+    // (suppression and hysteresis skip them), so only the interior is computed.
+    let mut gx = vec![0i32; w * h];
+    let mut gy = vec![0i32; w * h];
+    let mut mag = vec![0u32; w * h];
+    for y in 1..h - 1 {
+        let (up, row, down) = (
+            &blurred[(y - 1) * w..y * w],
+            &blurred[y * w..(y + 1) * w],
+            &blurred[(y + 1) * w..(y + 2) * w],
+        );
+        for x in 1..w - 1 {
+            let p = |r: &[u8], dx: usize| i32::from(r[x + dx - 1]);
+            let sx =
+                (p(up, 2) + 2 * p(row, 2) + p(down, 2)) - (p(up, 0) + 2 * p(row, 0) + p(down, 0));
+            let sy =
+                (p(down, 0) + 2 * p(down, 1) + p(down, 2)) - (p(up, 0) + 2 * p(up, 1) + p(up, 2));
+            let i = y * w + x;
+            gx[i] = sx;
+            gy[i] = sy;
+            mag[i] = (sx * sx + sy * sy) as u32;
+        }
+    }
+
+    // Non-maximum suppression along the gradient, quantized to 0/45/90/135
+    // degrees with tan(22.5) = 0.4142 and tan(67.5) = 2.4142 (x1024).
+    let mut thin = vec![0u32; w * h];
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            let (ax, ay) = (i64::from(gx[i].abs()), i64::from(gy[i].abs()));
+            let (n1, n2) = if ay * 1024 < ax * 424 {
+                (i - 1, i + 1)
+            } else if ay * 1024 > ax * 2472 {
+                (i - w, i + w)
+            } else if (gx[i] >= 0) == (gy[i] >= 0) {
+                (i + w + 1, i - w - 1)
+            } else {
+                (i + w - 1, i - w + 1)
+            };
+            if mag[i] >= mag[n1] && mag[i] >= mag[n2] {
+                thin[i] = mag[i];
+            }
+        }
+    }
+
+    // Hysteresis: strong edges, plus weak edges connected to them. Walks the
+    // same 6 neighbours as imageproc (it never steps up or up-right), so the
+    // edge maps, and the targets tuned on them, stay the same; following all
+    // 8 keeps more faint edges, which then merge neighbouring targets.
+    let low = (low_threshold * low_threshold) as u32;
+    let high = (high_threshold * high_threshold) as u32;
+    let edges = out.as_mut();
+    let mut stack = Vec::new();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            if thin[i] < high || edges[i] != 0 {
+                continue;
+            }
+            edges[i] = 255;
+            stack.push(i);
+            while let Some(j) = stack.pop() {
+                let (jx, jy) = (j % w, j / w);
+                for (dx, dy) in [(1, 0), (1, 1), (0, 1), (-1, -1), (-1, 0), (-1, 1)] {
+                    let (nx, ny) = (jx as isize + dx, jy as isize + dy);
+                    if nx < 1 || ny < 1 || nx >= w as isize - 1 || ny >= h as isize - 1 {
+                        continue;
+                    }
+                    let n = ny as usize * w + nx as usize;
+                    if edges[n] == 0 && thin[n] >= low {
+                        edges[n] = 255;
+                        stack.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Separable 7-tap Gaussian (sigma 1.4, as imageproc's kernel), replicated
+/// borders, fixed-point weights summing to 4096. Each pass truncates to u8
+/// like imageproc does; rounding instead loses faint dark-theme edges.
+fn gaussian_blur_7(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    const SIGMA: f32 = 1.4;
+    let raw: Vec<f32> = (-3..=3i32)
+        .map(|i| (-(i * i) as f32 / (2.0 * SIGMA * SIGMA)).exp())
+        .collect();
+    let sum: f32 = raw.iter().sum();
+    let k: Vec<u32> = raw
+        .iter()
+        .map(|v| (v / sum * 4096.0).round() as u32)
+        .collect();
+    let norm: u32 = k.iter().sum();
+
+    let clamp = |i: isize, n: usize| i.clamp(0, n as isize - 1) as usize;
+    // Horizontal pass, rounded back to u8 per pixel.
+    let mut tmp = vec![0u8; w * h];
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        for x in 0..w {
+            let acc: u32 = if x >= 3 && x + 3 < w {
+                k.iter()
+                    .zip(&row[x - 3..x + 4])
+                    .map(|(&kv, &p)| kv * u32::from(p))
+                    .sum()
+            } else {
+                k.iter()
+                    .enumerate()
+                    .map(|(t, &kv)| kv * u32::from(row[clamp(x as isize + t as isize - 3, w)]))
+                    .sum()
+            };
+            tmp[y * w + x] = (acc / norm) as u8;
+        }
+    }
+    // Vertical pass, row by row so memory is read in order.
+    let mut acc = vec![0u32; w];
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        acc.iter_mut().for_each(|a| *a = 0);
+        for (t, &kv) in k.iter().enumerate() {
+            let sy = clamp(y as isize + t as isize - 3, h);
+            for (a, &p) in acc.iter_mut().zip(&tmp[sy * w..(sy + 1) * w]) {
+                *a += kv * u32::from(p);
+            }
+        }
+        for (o, &a) in out[y * w..(y + 1) * w].iter_mut().zip(&acc) {
+            *o = (a / norm) as u8;
+        }
+    }
+    out
+}
+
 /// Binary dilation by a `kw` x `kh` rectangle centered on each pixel
 /// (separable; a running count per line keeps it O(pixels)).
 fn dilate_rect(mask: &GrayImage, kw: u32, kh: u32) -> GrayImage {
@@ -171,6 +336,142 @@ fn dilate_lines(
         }
     }
     out
+}
+
+/// The original detector (`hint.improved_detection = false`): downscale to
+/// `downscale_longest`, Canny, symmetric closing, connected components, and
+/// size limits relative to the working image. Kept unchanged so the two can be
+/// compared and the improved one stays opt-out.
+fn detect_classic(
+    bgra: &[u8],
+    capture_w: u32,
+    capture_h: u32,
+) -> anyhow::Result<Vec<HintCandidate>> {
+    if capture_w == 0 || capture_h == 0 {
+        bail!("cannot run hint CV detector on an empty capture");
+    }
+    if bgra.len() < (capture_w as usize * capture_h as usize * 4) {
+        bail!("screen capture buffer is smaller than declared dimensions");
+    }
+
+    let cfg = &config().hint;
+    let longest = capture_w.max(capture_h);
+    let scale = if cfg.downscale_longest > 0 && longest > cfg.downscale_longest {
+        cfg.downscale_longest as f32 / longest as f32
+    } else {
+        1.0
+    };
+    let ww = ((capture_w as f32 * scale).round() as u32).max(1);
+    let wh = ((capture_h as f32 * scale).round() as u32).max(1);
+
+    let gray = grayscale_resized(bgra, capture_w as usize, capture_h as usize, ww, wh);
+    let edges = imageproc::edges::canny(
+        &gray,
+        cfg.edge_low_threshold as f32,
+        cfg.edge_high_threshold as f32,
+    );
+    // Closing (dilate + erode) reconnects the broken strokes of one element
+    // without inflating boxes or bridging neighbours.
+    const CLOSE_RADIUS: u8 = 2;
+    let closed = imageproc::morphology::close(
+        &edges,
+        imageproc::distance_transform::Norm::LInf,
+        CLOSE_RADIUS,
+    );
+
+    let components = connected_component_boxes(&closed);
+
+    // Shape filters, relative to the working image so behaviour matches at
+    // 1080p and 4K: minimum side (sub-glyph noise), maximum side/area
+    // fractions (bars, panels, banners), maximum elongation (separators,
+    // scrollbars, underlines).
+    const MIN_SIZE: u32 = 8;
+    const MAX_SIZE_FRAC: f32 = 0.6;
+    const MAX_AREA_FRAC: f32 = 0.25;
+    const MAX_ASPECT: f32 = 12.0;
+
+    let work_area = (ww as f32) * (wh as f32);
+    let max_w = (MAX_SIZE_FRAC * ww as f32).max(MIN_SIZE as f32);
+    let max_h = (MAX_SIZE_FRAC * wh as f32).max(MIN_SIZE as f32);
+    let max_area = (MAX_AREA_FRAC * work_area).max(1.0);
+
+    let kept: Vec<(Component, f32)> = components
+        .into_iter()
+        .filter_map(|component| {
+            let (_, _, w, h) = component.bbox;
+            if w < MIN_SIZE || h < MIN_SIZE {
+                return None;
+            }
+            if (w as f32) > max_w || (h as f32) > max_h {
+                return None;
+            }
+            let area = (w as f32) * (h as f32);
+            if area > max_area {
+                return None;
+            }
+            let aspect = (w.max(h) as f32) / (w.min(h).max(1) as f32);
+            if aspect > MAX_ASPECT {
+                return None;
+            }
+            // Coherent controls fill their box; gradient/text speckle scores low.
+            let solidity = (component.pixels as f32 / area).clamp(0.0, 1.0);
+            Some((component, solidity))
+        })
+        .collect();
+
+    let kept = drop_icon_inner_boxes_classic(kept);
+
+    let inv_scale = 1.0 / scale;
+    Ok(kept
+        .into_iter()
+        .map(|(component, solidity)| {
+            let bbox = scale_box_to_capture(component.bbox, inv_scale, capture_w, capture_h);
+            HintCandidate {
+                bbox,
+                score: solidity,
+            }
+        })
+        .collect())
+}
+
+/// Drop a box sitting concentrically inside a small, near-square box — an
+/// icon glyph inside its own hit area, where both labels would point at the
+/// same place. Deliberately narrow so container children are preserved.
+/// Thresholds are in working-image pixels.
+fn drop_icon_inner_boxes_classic(mut items: Vec<(Component, f32)>) -> Vec<(Component, f32)> {
+    const MAX_PARENT_SIDE: u32 = 48;
+    const SQUARE_TOLERANCE: u32 = 6;
+    const CONCENTRIC_TOLERANCE: u32 = 6;
+
+    let boxes: Vec<(u32, u32, u32, u32)> = items.iter().map(|(c, _)| c.bbox).collect();
+    let mut drop = vec![false; boxes.len()];
+
+    for (i, &child) in boxes.iter().enumerate() {
+        let smallest_parent = boxes
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i && !drop[*j])
+            .filter(|(_, parent)| contains(**parent, child))
+            .min_by_key(|(_, parent)| parent.2 * parent.3)
+            .map(|(_, parent)| *parent);
+
+        let Some(parent) = smallest_parent else {
+            continue;
+        };
+        let near_square = parent.2.abs_diff(parent.3) <= SQUARE_TOLERANCE;
+        let small = parent.2 <= MAX_PARENT_SIDE && parent.3 <= MAX_PARENT_SIDE;
+        let child_center = (child.0 + child.2 / 2, child.1 + child.3 / 2);
+        let parent_center = (parent.0 + parent.2 / 2, parent.1 + parent.3 / 2);
+        let concentric = child_center.0.abs_diff(parent_center.0) <= CONCENTRIC_TOLERANCE
+            && child_center.1.abs_diff(parent_center.1) <= CONCENTRIC_TOLERANCE;
+        if small && near_square && concentric {
+            drop[i] = true;
+        }
+    }
+
+    let mut keep = drop.into_iter();
+    items.retain(|_| !keep.next().unwrap_or(false));
+    items
 }
 
 /// Map a working-image box back to clamped capture-pixel coordinates.
@@ -318,6 +619,77 @@ mod tests {
     }
 
     #[test]
+    fn fast_canny_matches_imageproc_on_synthetic_ui() {
+        // Buttons, faint dark-theme text strokes and a gradient: the cases the
+        // integer path must handle like imageproc.
+        let (w, h) = (320u32, 200u32);
+        let mut img = GrayImage::from_fn(w, h, |x, _| Luma([20 + (x / 8) as u8]));
+        for (x0, y0, bw, bh, v) in [
+            (20, 20, 80, 30, 200u8),
+            (120, 20, 60, 24, 60),
+            (40, 90, 200, 2, 90),
+        ] {
+            for y in y0..y0 + bh {
+                for x in x0..x0 + bw {
+                    img.put_pixel(x, y, Luma([v]));
+                }
+            }
+        }
+        for i in 0..40u32 {
+            let (x, y) = (30 + i * 6, 140 + (i * 7) % 20);
+            for d in 0..5 {
+                img.put_pixel(x + d % 2, y + d, Luma([120]));
+            }
+        }
+        // Compared after the widening the detector applies: the fixed-point
+        // blur can move a perfectly sharp synthetic edge by one pixel, which
+        // never changes a box.
+        let ours = dilate_rect(&fast_canny(&img, 50.0, 150.0), 4, 3);
+        let theirs = dilate_rect(&imageproc::edges::canny(&img, 50.0, 150.0), 4, 3);
+        let (mut both, mut either) = (0u32, 0u32);
+        for (a, b) in ours.as_raw().iter().zip(theirs.as_raw()) {
+            both += u32::from(*a != 0 && *b != 0);
+            either += u32::from(*a != 0 || *b != 0);
+        }
+        assert!(either > 100, "test image produced too few edges");
+        let agreement = f64::from(both) / f64::from(either);
+        assert!(agreement > 0.97, "edge masks diverge: {agreement}");
+    }
+
+    #[test]
+    fn classic_icon_inner_box_is_dropped_but_container_children_survive() {
+        let comp = |bbox: (u32, u32, u32, u32)| {
+            (
+                Component {
+                    bbox,
+                    pixels: bbox.2 * bbox.3,
+                },
+                1.0,
+            )
+        };
+        // Small near-square icon (outer ring) with a concentric inner glyph.
+        let icon_outer = comp((100, 100, 24, 24));
+        let icon_inner = comp((106, 106, 12, 12));
+        // A large container with two real buttons inside it.
+        let container = comp((0, 0, 400, 120));
+        let button_a = comp((10, 20, 80, 30));
+        let button_b = comp((120, 20, 80, 30));
+
+        let kept = drop_icon_inner_boxes_classic(vec![
+            icon_outer, icon_inner, container, button_a, button_b,
+        ]);
+        let boxes: Vec<_> = kept.iter().map(|(c, _)| c.bbox).collect();
+
+        // The concentric inner glyph is gone.
+        assert!(!boxes.contains(&(106, 106, 12, 12)));
+        // Everything else — including the container's children — is preserved.
+        assert!(boxes.contains(&(100, 100, 24, 24)));
+        assert!(boxes.contains(&(0, 0, 400, 120)));
+        assert!(boxes.contains(&(10, 20, 80, 30)));
+        assert!(boxes.contains(&(120, 20, 80, 30)));
+    }
+
+    #[test]
     fn dilation_is_wider_than_tall() {
         // One set pixel in the middle of a 9x9 mask, dilated by a 5x3 rectangle.
         let mut img = GrayImage::new(9, 9);
@@ -408,6 +780,29 @@ mod probe {
             bgra[i * 4 + 2] = rgb[i * 3];
         }
         (bgra, w, h)
+    }
+
+    #[test]
+    #[ignore = "set STOCHOS_CV_IMAGE to a P6 .ppm screenshot"]
+    fn fast_canny_matches_imageproc() {
+        let path = std::env::var("STOCHOS_CV_IMAGE").expect("set STOCHOS_CV_IMAGE");
+        let (bgra, w, h) = read_ppm(&path);
+        let gray = grayscale_resized(&bgra, w as usize, h as usize, w / 2, h / 2);
+        let t = std::time::Instant::now();
+        let ours = fast_canny(&gray, 50.0, 150.0);
+        let ours_t = t.elapsed();
+        let t = std::time::Instant::now();
+        let theirs = imageproc::edges::canny(&gray, 50.0, 150.0);
+        let theirs_t = t.elapsed();
+        let (mut both, mut either) = (0u64, 0u64);
+        for (a, b) in ours.as_raw().iter().zip(theirs.as_raw()) {
+            both += u64::from(*a != 0 && *b != 0);
+            either += u64::from(*a != 0 || *b != 0);
+        }
+        let agreement = both as f64 / either.max(1) as f64;
+        eprintln!("fast {ours_t:?} vs imageproc {theirs_t:?}, edge agreement {agreement:.4}");
+        // The blur rounds in fixed point, so a few faint edge pixels differ.
+        assert!(agreement > 0.97, "edge masks diverge: {agreement}");
     }
 
     #[test]
