@@ -145,7 +145,7 @@ An alternative mode that labels likely clickable UI targets directly, instead of
 Detection is pluggable behind a `HintDetector` trait, selected by `hint.detector`:
 
 - **`atspi`** (Linux, built in): reads the desktop [AT-SPI](https://docs.rs/atspi) accessibility tree over D-Bus and labels interactive elements using their roles and bounds. It is usually the most accurate detector. GTK, Qt, and Gecko apps tend to work well; Chromium/Electron may need accessibility enabled; games and canvas-heavy apps may expose little or nothing. On Wayland, exact placement requires compositor support; Hyprland and Sway are supported. On X11, coordinates are already absolute. Only the primary monitor is handled.
-- **`cv`** (always available): a pure-Rust computer-vision pass over a screenshot — downscale → Canny edges → morphological closing → connected components → resolution-relative size/shape filtering with a per-box quality score. No model, no network, no services to talk to. CV sees visual *structure*, not semantic clickability, so it will still occasionally label a border, separator, or decorative shape, and miss a low-contrast control. Tune `edge_low_threshold`/`edge_high_threshold` (raise to cut clutter, lower to catch faint controls).
+- **`cv`** (always available): a pure-Rust computer-vision pass over a screenshot — resize to the logical screen resolution → Canny edges → wider-than-tall dilation (joins the letters of a word, keeps lines apart) → connected components → size filtering in logical pixels → drop boxes nested inside a control, with a per-box quality score. No model, no network, no services to talk to. CV sees visual *structure*, not semantic clickability, so it will still occasionally label a border, separator, or decorative shape, and miss a low-contrast control. Tune `edge_low_threshold`/`edge_high_threshold` (raise to cut clutter, lower to catch faint controls).
 - **`auto`** (default): tries AT-SPI first and falls back to CV when needed. If an app exposes window chrome but not content, CV labels the unhandled content area. On macOS it reads the Accessibility API instead, and runs CV only when that finds too few targets, limited to the focused window.
 
 ```toml
@@ -300,7 +300,7 @@ max_speed = 500
 - `alphabet` sets the characters used for generated hint labels. Defaults to the same set as `[grid].hints`; override to change which keys label elements.
 - `max_label_len` caps generated label length. Higher values allow more targets, but require more keystrokes.
 - `auto_click` clicks as soon as the typed label uniquely matches one target. Leave it `false` if you want to choose the action after selecting.
-- `downscale_longest` controls CV detector speed/precision. Lower values are faster but less precise; `0` disables downscaling.
+- `downscale_longest` caps the CV detector's working resolution (it never works above the logical screen size). Lower values are faster but miss tiny controls; raise it to your logical width (e.g. `2560`) to catch small icons and chevrons, at roughly 4x the detection time. `0` removes the cap.
 - `edge_low_threshold` / `edge_high_threshold` tune Canny edge detection. Lower values find more targets and more false positives; higher values are stricter.
 
 ### Free mode
