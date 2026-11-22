@@ -1,14 +1,14 @@
 //! Pure computer-vision detector (always-available fallback; `image` +
-//! `imageproc` only). Pipeline: downscale → grayscale → Canny → morphological
-//! close → connected components → shape filtering/scoring → drop icon-in-hit-area
-//! nesting. Sees visual structure, not semantic clickability.
+//! `imageproc` only). Pipeline: resize to the logical screen resolution →
+//! grayscale → Canny → wider-than-tall dilation (joins a word's letters, keeps
+//! lines apart) → connected components → size filtering in logical pixels →
+//! drop boxes nested inside a control. Sees visual structure, not semantic
+//! clickability.
 
 use anyhow::{bail, Context};
 use image::{GrayImage, Luma};
 use imageproc::{
-    distance_transform::Norm,
     edges::canny,
-    morphology::close,
     region_labelling::{connected_components, Connectivity},
 };
 use std::collections::HashMap;
@@ -28,7 +28,8 @@ impl HintDetector for CvHintDetector {
         let capture = backend.capture_screen().context(
             "hint mode requires screen capture; the CV detector cannot run on this backend",
         )?;
-        let candidates = detect_candidates_cv(&capture.bgra, capture.w, capture.h)?;
+        let (logical_w, _) = backend.screen_size();
+        let candidates = detect_candidates_cv(&capture.bgra, capture.w, capture.h, logical_w)?;
         Ok(DetectorOutput {
             candidates,
             capture_w: capture.w,
@@ -45,10 +46,14 @@ struct Component {
     pixels: u32,
 }
 
+/// `logical_w` is the screen width in logical (scaled) pixels, so size limits
+/// mean the same thing on a 1080p screen and a HiDPI one; 0 treats capture
+/// pixels as logical.
 fn detect_candidates_cv(
     bgra: &[u8],
     capture_w: u32,
     capture_h: u32,
+    logical_w: u32,
 ) -> anyhow::Result<Vec<HintCandidate>> {
     if capture_w == 0 || capture_h == 0 {
         bail!("cannot run hint CV detector on an empty capture");
@@ -58,14 +63,25 @@ fn detect_candidates_cv(
     }
 
     let cfg = &config().hint;
-    let longest = capture_w.max(capture_h);
-    let scale = if cfg.downscale_longest > 0 && longest > cfg.downscale_longest {
-        cfg.downscale_longest as f32 / longest as f32
+    // Work at the logical resolution: HiDPI captures carry no extra UI, only
+    // sharper pixels, and the smaller image is much faster.
+    let mut scale = if logical_w > 0 && logical_w < capture_w {
+        logical_w as f32 / capture_w as f32
     } else {
         1.0
     };
+    let longest = capture_w.max(capture_h) as f32 * scale;
+    if cfg.downscale_longest > 0 && longest > cfg.downscale_longest as f32 {
+        scale *= cfg.downscale_longest as f32 / longest;
+    }
     let ww = ((capture_w as f32 * scale).round() as u32).max(1);
     let wh = ((capture_h as f32 * scale).round() as u32).max(1);
+    // Working pixels per logical pixel: 1 unless `downscale_longest` capped it.
+    let k = if logical_w > 0 {
+        scale * capture_w as f32 / logical_w as f32
+    } else {
+        scale
+    };
 
     let gray = grayscale_resized(bgra, capture_w as usize, capture_h as usize, ww, wh);
     let edges = canny(
@@ -73,52 +89,39 @@ fn detect_candidates_cv(
         cfg.edge_low_threshold as f32,
         cfg.edge_high_threshold as f32,
     );
-    // Closing (dilate + erode) reconnects the broken strokes of one element
-    // without inflating boxes or bridging neighbours.
-    const CLOSE_RADIUS: u8 = 2;
-    let closed = close(&edges, Norm::LInf, CLOSE_RADIUS);
+    // Wider than tall: the letters of a word (and an icon next to its label)
+    // join into one target, while lines of text stay separate.
+    let joined = dilate_rect(
+        &edges,
+        ((3.5 * k).round() as u32).max(1),
+        ((2.5 * k).round() as u32).max(1),
+    );
 
-    let components = connected_component_boxes(&closed);
+    let components = connected_component_boxes(&joined);
 
-    // Shape filters, relative to the working image so behaviour matches at
-    // 1080p and 4K: minimum side (sub-glyph noise), maximum side/area
-    // fractions (bars, panels, banners), maximum elongation (separators,
-    // scrollbars, underlines).
-    const MIN_SIZE: u32 = 8;
-    const MAX_SIZE_FRAC: f32 = 0.6;
-    const MAX_AREA_FRAC: f32 = 0.25;
-    const MAX_ASPECT: f32 = 12.0;
-
-    let work_area = (ww as f32) * (wh as f32);
-    let max_w = (MAX_SIZE_FRAC * ww as f32).max(MIN_SIZE as f32);
-    let max_h = (MAX_SIZE_FRAC * wh as f32).max(MIN_SIZE as f32);
-    let max_area = (MAX_AREA_FRAC * work_area).max(1.0);
+    // Size limits in logical px. Below: specks, underlines and separators.
+    // Above: panels, paragraphs and bars, which are containers, not targets.
+    const MIN_W: f32 = 7.0;
+    const MIN_H: f32 = 3.0;
+    const MAX_W: f32 = 500.0;
+    const MAX_H: f32 = 50.0;
 
     let kept: Vec<(Component, f32)> = components
         .into_iter()
         .filter_map(|component| {
             let (_, _, w, h) = component.bbox;
-            if w < MIN_SIZE || h < MIN_SIZE {
-                return None;
-            }
-            if (w as f32) > max_w || (h as f32) > max_h {
-                return None;
-            }
-            let area = (w as f32) * (h as f32);
-            if area > max_area {
-                return None;
-            }
-            let aspect = (w.max(h) as f32) / (w.min(h).max(1) as f32);
-            if aspect > MAX_ASPECT {
+            let (lw, lh) = (w as f32 / k, h as f32 / k);
+            if lw <= MIN_W || lh <= MIN_H || lw >= MAX_W || lh >= MAX_H {
                 return None;
             }
             // Coherent controls fill their box; gradient/text speckle scores low.
+            let area = (w as f32) * (h as f32);
             let solidity = (component.pixels as f32 / area).clamp(0.0, 1.0);
             Some((component, solidity))
         })
         .collect();
 
-    let kept = drop_icon_inner_boxes(kept);
+    let kept = drop_icon_inner_boxes(kept, k);
 
     let inv_scale = 1.0 / scale;
     Ok(kept
@@ -131,6 +134,43 @@ fn detect_candidates_cv(
             }
         })
         .collect())
+}
+
+/// Binary dilation by a `kw` x `kh` rectangle centered on each pixel
+/// (separable; a running count per line keeps it O(pixels)).
+fn dilate_rect(mask: &GrayImage, kw: u32, kh: u32) -> GrayImage {
+    let (w, h) = (mask.width() as usize, mask.height() as usize);
+    let rows = dilate_lines(mask.as_raw(), w, h, 1, w, kw as usize);
+    let cols = dilate_lines(&rows, h, w, w, 1, kh as usize);
+    GrayImage::from_vec(w as u32, h as u32, cols).expect("same dimensions")
+}
+
+/// Dilate `count` lines of `len` pixels; pixel `i` of line `l` is at
+/// `l * line_step + i * step`.
+fn dilate_lines(
+    src: &[u8],
+    len: usize,
+    count: usize,
+    step: usize,
+    line_step: usize,
+    k: usize,
+) -> Vec<u8> {
+    let (before, after) = ((k.max(1) - 1) / 2, k.max(1) / 2);
+    let mut out = vec![0u8; src.len()];
+    let mut prefix = vec![0u32; len + 1];
+    for l in 0..count {
+        let at = |i: usize| l * line_step + i * step;
+        for i in 0..len {
+            prefix[i + 1] = prefix[i] + u32::from(src[at(i)] != 0);
+        }
+        for i in 0..len {
+            let (lo, hi) = (i.saturating_sub(before), (i + after + 1).min(len));
+            if prefix[hi] > prefix[lo] {
+                out[at(i)] = 255;
+            }
+        }
+    }
+    out
 }
 
 /// Map a working-image box back to clamped capture-pixel coordinates.
@@ -151,14 +191,16 @@ fn scale_box_to_capture(
     (nx, ny, nw, nh)
 }
 
-/// Drop a box sitting concentrically inside a small, near-square box — an
-/// icon glyph inside its own hit area, where both labels would point at the
-/// same place. Deliberately narrow so container children are preserved.
-/// Thresholds are in working-image pixels.
-fn drop_icon_inner_boxes(mut items: Vec<(Component, f32)>) -> Vec<(Component, f32)> {
-    const MAX_PARENT_SIDE: u32 = 48;
-    const SQUARE_TOLERANCE: u32 = 6;
-    const CONCENTRIC_TOLERANCE: u32 = 6;
+/// Drop a box inside another kept box when both labels would point at the
+/// same control: text centered in its button, a glyph inside a small square
+/// icon, or the flat strokes of an icon (hamburger lines). `k` is working
+/// pixels per logical pixel; thresholds below are logical px.
+fn drop_icon_inner_boxes(mut items: Vec<(Component, f32)>, k: f32) -> Vec<(Component, f32)> {
+    let px = |logical: f32| (logical * k).round() as u32;
+    let max_icon_side = px(40.0);
+    let square_tolerance = px(5.0);
+    let concentric_tolerance = px(8.0);
+    let max_flat_h = px(6.0);
 
     let boxes: Vec<(u32, u32, u32, u32)> = items.iter().map(|(c, _)| c.bbox).collect();
     let mut drop = vec![false; boxes.len()];
@@ -167,7 +209,7 @@ fn drop_icon_inner_boxes(mut items: Vec<(Component, f32)>) -> Vec<(Component, f3
         let smallest_parent = boxes
             .iter()
             .enumerate()
-            .filter(|(j, _)| *j != i && !drop[*j])
+            .filter(|(j, parent)| *j != i && **parent != child)
             .filter(|(_, parent)| contains(**parent, child))
             .min_by_key(|(_, parent)| parent.2 * parent.3)
             .map(|(_, parent)| *parent);
@@ -175,13 +217,15 @@ fn drop_icon_inner_boxes(mut items: Vec<(Component, f32)>) -> Vec<(Component, f3
         let Some(parent) = smallest_parent else {
             continue;
         };
-        let near_square = parent.2.abs_diff(parent.3) <= SQUARE_TOLERANCE;
-        let small = parent.2 <= MAX_PARENT_SIDE && parent.3 <= MAX_PARENT_SIDE;
+        let small_square = parent.2.abs_diff(parent.3) <= square_tolerance
+            && parent.2 <= max_icon_side
+            && parent.3 <= max_icon_side;
         let child_center = (child.0 + child.2 / 2, child.1 + child.3 / 2);
         let parent_center = (parent.0 + parent.2 / 2, parent.1 + parent.3 / 2);
-        let concentric = child_center.0.abs_diff(parent_center.0) <= CONCENTRIC_TOLERANCE
-            && child_center.1.abs_diff(parent_center.1) <= CONCENTRIC_TOLERANCE;
-        if small && near_square && concentric {
+        let concentric = child_center.0.abs_diff(parent_center.0) <= concentric_tolerance
+            && child_center.1.abs_diff(parent_center.1) <= concentric_tolerance;
+        let flat = child.3 <= max_flat_h;
+        if small_square || concentric || flat {
             drop[i] = true;
         }
     }
@@ -274,6 +318,22 @@ mod tests {
     }
 
     #[test]
+    fn dilation_is_wider_than_tall() {
+        // One set pixel in the middle of a 9x9 mask, dilated by a 5x3 rectangle.
+        let mut img = GrayImage::new(9, 9);
+        img.put_pixel(4, 4, Luma([255]));
+        let out = dilate_rect(&img, 5, 3);
+        let set: Vec<(u32, u32)> = out
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[0] != 0)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        let expected: Vec<(u32, u32)> =
+            (3..=5).flat_map(|y| (2..=6).map(move |x| (x, y))).collect();
+        assert_eq!(set, expected);
+    }
+
+    #[test]
     fn icon_inner_box_is_dropped_but_container_children_survive() {
         let comp = |bbox: (u32, u32, u32, u32)| {
             (
@@ -292,8 +352,10 @@ mod tests {
         let button_a = comp((10, 20, 80, 30));
         let button_b = comp((120, 20, 80, 30));
 
-        let kept =
-            drop_icon_inner_boxes(vec![icon_outer, icon_inner, container, button_a, button_b]);
+        let kept = drop_icon_inner_boxes(
+            vec![icon_outer, icon_inner, container, button_a, button_b],
+            1.0,
+        );
         let boxes: Vec<_> = kept.iter().map(|(c, _)| c.bbox).collect();
 
         // The concentric inner glyph is gone.
@@ -309,7 +371,7 @@ mod tests {
 /// Dev tool, not a test of invariants: run the CV detector over a real
 /// screenshot and print every candidate box, to study behaviour on actual UIs:
 ///   grim -t ppm /tmp/shot.ppm
-///   STOCHOS_CV_IMAGE=/tmp/shot.ppm cargo test --release -- --ignored --nocapture cv_boxes
+///   STOCHOS_CV_IMAGE=/tmp/shot.ppm STOCHOS_CV_LOGICAL_W=2560 cargo test --release -- --ignored --nocapture cv_boxes
 #[cfg(test)]
 mod probe {
     use super::*;
@@ -359,7 +421,11 @@ mod probe {
         crate::config::init().expect("load config");
         let (bgra, w, h) = read_ppm(&path);
         let start = std::time::Instant::now();
-        let candidates = detect_candidates_cv(&bgra, w, h).expect("cv detection");
+        let logical_w = std::env::var("STOCHOS_CV_LOGICAL_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let candidates = detect_candidates_cv(&bgra, w, h, logical_w).expect("cv detection");
         eprintln!(
             "cv: {} candidates in {:?} on {w}x{h}",
             candidates.len(),
